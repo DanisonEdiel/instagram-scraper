@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Testing & cache
+.coverage
+coverage.xml
+htmlcov/
+.cache/
+.pytest_cache/
+
+# Envs
+.env
+.env.*
+.venv/
+venv/
+
+# IDE/OS
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+*.log
+
+# Descargas temporales
+downloads/
+
+# Auth storage
+storage/
+storage_state.json
+auth_state.enc
