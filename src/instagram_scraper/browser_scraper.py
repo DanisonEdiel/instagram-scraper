@@ -160,7 +160,7 @@ class BrowserInstagramScraper:
                     "    const part = users.slice(i, i + chunkSize);\n"
                     "    const results = await Promise.all(part.map(async it => {\n"
                     "      try {\n"
-                    "        const r3 = await fetchRetry('https://www.instagram.com/api/v1/users/web_profile_info/?username=' + encodeURIComponent(it.username));\n"
+                    "        const r3 = await fetchRetry('https://www.instagram.com/api/v1/users/web_profile_info/?username=' + encodeURIComponent(it.username), { headers: h });\n"
                     "        const j3 = await r3.json();\n"
                     "        const c = j3?.data?.user?.edge_followed_by?.count ?? null;\n"
                     "        return { username: it.username, followers: c };\n"
@@ -190,18 +190,86 @@ class BrowserInstagramScraper:
                     page.goto(f"https://www.instagram.com/{username}/", timeout=30000)
                     try:
                         jscode_count = (
-                            "(async (u) => {\n"
-                            "  try {\n"
-                            "    const h = { 'x-ig-app-id': '936619743392459' };\n"
-                            "    const r = await fetch('https://www.instagram.com/api/v1/users/web_profile_info/?username=' + encodeURIComponent(u), { headers: h });\n"
-                            "    const j = await r.json();\n"
-                            "    return j?.data?.user?.edge_followed_by?.count ?? null;\n"
-                            "  } catch(e) { return null; }\n"
-                            "})('" + username + "')"
+                            "(async (u, tries, baseDelay) => {\n"
+                            "  function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }\n"
+                            "  async function fetchRetry(url, opts={}, triesParam=tries, delay=baseDelay){\n"
+                            "    for (let i=0; i<triesParam; i++){\n"
+                            "      const res = await fetch(url, opts).catch(()=>null);\n"
+                            "      if (res && res.ok) return res;\n"
+                            "      const status = res ? res.status : 0;\n"
+                            "      if (status===429 || status===0){ const jitter=Math.floor(Math.random()*900); await sleep(delay+jitter); delay=Math.min(Math.floor(delay*1.7),15000); continue;}\n"
+                            "      throw new Error('HTTP ' + status);\n"
+                            "    }\n"
+                            "    throw new Error('Too many retries');\n"
+                            "  }\n"
+                            "  const h = { 'x-ig-app-id': '936619743392459', 'x-requested-with': 'XMLHttpRequest', 'referer': location.origin + '/' };\n"
+                            "  const m = document.cookie.match(/csrftoken=([^;]+)/);\n"
+                            "  if (m) h['x-csrftoken'] = m[1];\n"
+                            "  const r = await fetchRetry('https://www.instagram.com/api/v1/users/web_profile_info/?username=' + encodeURIComponent(u), { headers: h });\n"
+                            "  const j = await r.json();\n"
+                            "  return j?.data?.user?.edge_followed_by?.count ?? null;\n"
+                            ")('" + username + "', " + str(retry_tries) + ", " + str(retry_base_ms) + ")"
                         )
                         count_val = page.evaluate(jscode_count)
                     except Exception:
                         count_val = None
+                    # Fallback: intenta leer el conteo directamente del DOM del perfil
+                    if count_val is None:
+                        try:
+                            dom_count = page.evaluate(
+                                """
+(() => {
+  function parseNum(txt){
+    if (!txt) return null;
+    const t = String(txt).trim();
+    const m = t.match(/([0-9.,]+)\s*([kKmM])?/);
+    if (!m) return null;
+    let n = m[1].replace(/\s/g,'');
+    n = n.replace(/\.(?=\d{3}\b)/g,'');
+    n = n.replace(/,(?=\d{3}\b)/g,'');
+    let val = Number(n.replace(',', '.'));
+    const suf = m[2] ? m[2].toLowerCase() : '';
+    if (suf==='k') val = Math.round(val*1000);
+    if (suf==='m') val = Math.round(val*1000000);
+    return Number.isFinite(val) ? val : null;
+  }
+  const selStr = `a[href$='/followers/'] span, a[href$='/followers/'] div, header section ul li a[href$='/followers/']`;
+  const selectors = selStr.split(/\s*,\s*/);
+  for (const sel of selectors){
+    const el = document.querySelector(sel);
+    if (el){
+      const v = parseNum(el.textContent||el.innerText||'');
+      if (v!==null) return v;
+    }
+  }
+  const m = document.querySelector('meta[property="og:description"]');
+  const t = m ? (m.getAttribute('content')||'') : '';
+  const re = /([0-9.,]+)\s*(followers|seguidores)/i;
+  const mm = t.match(re);
+  if (mm){
+    const v = parseNum(mm[1]);
+    if (v!==null) return v;
+  }
+  return null;
+})()
+"""
+                            )
+                            count_val = dom_count
+                        except Exception:
+                            pass
+                    # Detecta si el perfil es privado y devuelve temprano con mensaje claro
+                    try:
+                        is_private = page.evaluate(
+                            "(() => {\n"
+                            "  const text = (document.body && document.body.innerText) ? document.body.innerText : '';\n"
+                            "  return /(this account is private|esta cuenta es privada|cuenta privada)/i.test(text);\n"
+                            "})()"
+                        )
+                        if is_private:
+                            logger.warning("Perfil privado: el listado de seguidores no está disponible si no sigues la cuenta")
+                            return {"username": username, "count": count_val, "followers_of_followers": []}
+                    except Exception:
+                        pass
                     try:
                         for btn in [
                             page.get_by_role("button", name="Permitir todas las cookies").first,
@@ -218,14 +286,33 @@ class BrowserInstagramScraper:
                     page.wait_for_selector("div[role='dialog']", timeout=20000)
                     usernames: List[str] = []
                     last_len = -1
-                    # Extrae usernames usando JS dentro del diálogo y scrollea hasta alcanzar el límite o no haya nuevos
+                    unchanged_rounds = 0
+                    # Scrollea y extrae varias veces para cargar elementos virtualizados del diálogo
                     while len(usernames) < limit:
+                        # Primero intenta desplazar para forzar carga
+                        try:
+                            page.evaluate(
+                                "(() => {\n"
+                                "  const dlg = document.querySelector('div[role=\"dialog\"]');\n"
+                                "  if (!dlg) return false;\n"
+                                "  const nodes = [dlg, ...Array.from(dlg.querySelectorAll('*'))];\n"
+                                "  const sc = nodes.find(n => (n.scrollHeight||0) > (n.clientHeight||0));\n"
+                                "  if (!sc) return false;\n"
+                                "  sc.scrollTop = sc.scrollHeight;\n"
+                                "  return true;\n"
+                                "})()"
+                            )
+                        except Exception:
+                            page.mouse.wheel(0, 3000)
+                        page.wait_for_timeout(800)
+
+                        # Luego extrae usernames visibles
                         try:
                             found = page.evaluate(
                                 "(() => {\n"
                                 "  const dlg = document.querySelector('div[role=\"dialog\"]');\n"
                                 "  if (!dlg) return [];\n"
-                                "  const anchors = Array.from(dlg.querySelectorAll('a[href^=\"/\"][href$=\"/\"]'));\n"
+                                "  const anchors = Array.from(dlg.querySelectorAll('a[href^=\"/\"][href$=\"/\"], a[role=\"link\"][href^=\"/\"][href$=\"/\"]'));\n"
                                 "  const out = [];\n"
                                 "  for (const a of anchors) {\n"
                                 "    const href = a.getAttribute('href') || '';\n"
@@ -247,23 +334,21 @@ class BrowserInstagramScraper:
                                 if len(usernames) >= limit:
                                     break
                         if len(usernames) == last_len:
-                            break
+                            unchanged_rounds += 1
+                        else:
+                            unchanged_rounds = 0
                         last_len = len(usernames)
-                        try:
-                            page.evaluate(
-                                "(() => {\n"
-                                "  const dlg = document.querySelector('div[role=\"dialog\"]');\n"
-                                "  if (!dlg) return false;\n"
-                                "  const nodes = [dlg, ...Array.from(dlg.querySelectorAll('*'))];\n"
-                                "  const sc = nodes.find(n => (n.scrollHeight||0) > (n.clientHeight||0));\n"
-                                "  if (!sc) return false;\n"
-                                "  sc.scrollTop = sc.scrollHeight;\n"
-                                "  return true;\n"
-                                "})()"
-                            )
-                        except Exception:
-                            page.mouse.wheel(0, 3000)
-                        page.wait_for_timeout(1200)
+                        if unchanged_rounds >= 5:
+                            try:
+                                logger.info(
+                                    "Sin nuevos usernames tras %d rondas; procesando %d usuarios",
+                                    unchanged_rounds,
+                                    len(usernames),
+                                )
+                            except Exception:
+                                pass
+                            break
+                        page.wait_for_timeout(max(delay_ms, 1200))
 
                     out: List[Dict[str, Any]] = []
                     for uname in usernames[:limit]:
@@ -299,19 +384,39 @@ class BrowserInstagramScraper:
                         if out[-1].get("followers") is None:
                             try:
                                 page.goto(f"https://www.instagram.com/{uname}/", timeout=30000)
-                                page.wait_for_selector("meta[property='og:description']", timeout=15000)
-                                meta_val = page.evaluate(
+                                dom_val = page.evaluate(
                                     "(() => {\n"
+                                    "  function parseNum(txt){\n"
+                                    "    if (!txt) return null;\n"
+                                    "    const t = String(txt).trim();\n"
+                                    "    const m = t.match(/([0-9.,]+)\\s*([kKmM])?/);\n"
+                                    "    if (!m) return null;\n"
+                                    "    let n = m[1].replace(/\\s/g,'');\n"
+                                    "    n = n.replace(/\\.(?=\\d{3}\\b)/g,'');\n"
+                                    "    n = n.replace(/,(?=\\d{3}\\b)/g,'');\n"
+                                    "    let val = Number(n.replace(',', '.'));\n"
+                                    "    const suf = m[2] ? m[2].toLowerCase() : '';\n"
+                                    "    if (suf==='k') val = Math.round(val*1000);\n"
+                                    "    if (suf==='m') val = Math.round(val*1000000);\n"
+                                    "    return Number.isFinite(val) ? val : null;\n"
+                                    "  }\n"
+                                    "  const candidates = Array.from(document.querySelectorAll(`a[href$='/followers/'] span, a[href$='/followers/'] div, header section ul li a[href$='/followers/']`));\n"
+                                    "  for (const el of candidates){\n"
+                                    "    const v = parseNum(el.textContent||el.innerText||'');\n"
+                                    "    if (v!==null) return v;\n"
+                                    "  }\n"
                                     "  const m = document.querySelector('meta[property=\"og:description\"]');\n"
                                     "  const t = m ? (m.getAttribute('content')||'') : '';\n"
-                                    "  const re = /([0-9.,]+)\s*(followers|seguidores)/i;\n"
+                                    "  const re = /([0-9.,]+)\\s*(followers|seguidores)/i;\n"
                                     "  const mm = t.match(re);\n"
-                                    "  if (!mm) return null;\n"
-                                    "  const num = mm[1].replace(/[.,\s]/g,'');\n"
-                                    "  return Number(num)||null;\n"
+                                    "  if (mm){\n"
+                                    "    const v = parseNum(mm[1]);\n"
+                                    "    if (v!==null) return v;\n"
+                                    "  }\n"
+                                    "  return null;\n"
                                     "})()"
                                 )
-                                out[-1] = {"username": uname, "followers": meta_val}
+                                out[-1] = {"username": uname, "followers": dom_val}
                             except Exception:
                                 pass
                     try:

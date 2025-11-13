@@ -77,9 +77,9 @@ def main() -> None:
             retry_base_ms=args.retry_base_ms,
         )
         out_path = getattr(args, "output", None)
-        if out_path and out_path.suffix.lower() == ".xlsx":
+        followers_items = data.get("followers_of_followers", [])
+        if out_path and out_path.suffix.lower() in {".xlsx", ".csv"}:
             rows = []
-            followers_items = data.get("followers_of_followers", [])
             print(f"Items scrapeados: {len(followers_items)}")
             for it in followers_items:
                 username = it.get("username")
@@ -90,20 +90,38 @@ def main() -> None:
                     s = str(followers)
                     first_digit = int(s[0]) if s else None
                 rows.append([username, followers if followers is not None else "", first_digit if first_digit is not None else ""])
-            try:
-                from openpyxl import Workbook
-                wb = Workbook()
-                ws = wb.active
-                ws.title = "followers"
-                ws.append(["username", "seguidores", "primer_digito"])
-                for r in rows:
-                    ws.append(r)
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                wb.save(str(out_path))
-                print(f"Archivo Excel guardado en {out_path}")
-                print(f"Tiempo total: {round(_t.time()-t0, 2)}s")
-            except Exception as e:
-                print(f"No se pudo escribir Excel (.xlsx): {e}. Se imprimirá JSON.")
+
+            if out_path.suffix.lower() == ".xlsx":
+                try:
+                    from openpyxl import Workbook
+                    wb = Workbook()
+                    ws = wb.active
+                    ws.title = "followers"
+                    ws.append(["username", "seguidores", "primer_digito"])
+                    for r in rows:
+                        ws.append(r)
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    wb.save(str(out_path))
+                    print(f"Archivo Excel guardado en {out_path}")
+                    print(f"Tiempo total: {round(_t.time()-t0, 2)}s")
+                    return
+                except Exception as e:
+                    print(f"No se pudo escribir Excel (.xlsx): {e}. Se imprimirá JSON.")
+
+            if out_path.suffix.lower() == ".csv":
+                try:
+                    import csv
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    with out_path.open("w", newline="", encoding="utf-8") as f:
+                        writer = csv.writer(f)
+                        writer.writerow(["username", "seguidores", "primer_digito"])
+                        for r in rows:
+                            writer.writerow(r)
+                    print(f"Archivo CSV guardado en {out_path}")
+                    print(f"Tiempo total: {round(_t.time()-t0, 2)}s")
+                    return
+                except Exception as e:
+                    print(f"No se pudo escribir CSV (.csv): {e}. Se imprimirá JSON.")
     elif args.command == "legacy":
         scraper = InstagramScraper(config)
         if getattr(args, "login", False):
