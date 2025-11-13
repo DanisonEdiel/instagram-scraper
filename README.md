@@ -1,45 +1,45 @@
-# Instagram Scraper (Python)
+# Scraper de Instagram (Python)
 
-Monolithic Python project that scrapes Instagram profile data from a profile URL. It uses Instaloader (robust and optimized for Instagram scraping) and Playwright for Facebook OAuth login. The codebase follows clean coding practices and a standard folder structure.
+Proyecto monolítico en Python que extrae datos de perfiles de Instagram a partir de una URL de perfil. Usa Instaloader (robusto y optimizado para scraping de Instagram) y Playwright para iniciar sesión vía OAuth de Facebook. El código sigue prácticas de clean code y una estructura estándar.
 
-## Features
-- Extracts core profile fields: `username`, `full_name`, `biography`, `external_url`, `is_verified`, `is_private`, `profile_pic_url`, `followers`, `following`, `posts_count`.
-- Retrieves the latest N posts (default 5): `shortcode`, `url`, `date`, `caption`.
-- Works without login for public profiles; supports optional login via environment variables to expand data and reduce blocks.
-- Simple CLI to run scraping from the terminal and export JSON.
+## Funcionalidades
+- Extrae campos principales del perfil: `username`, `full_name`, `biography`, `external_url`, `is_verified`, `is_private`, `profile_pic_url`, `followers`, `following`, `posts_count`.
+- Obtiene las últimas N publicaciones (por defecto 5): `shortcode`, `url`, `date`, `caption`.
+- Funciona sin login para perfiles públicos; soporta login opcional vía variables de entorno para ampliar datos y reducir bloqueos.
+- CLI simple para ejecutar desde la terminal y exportar JSON.
 
-## Requirements
+## Requisitos
 - Python 3.10+
-- Dependencies: `instaloader`, `python-dotenv`, `playwright`, `cryptography`
+- Dependencias: `instaloader`, `python-dotenv`, `playwright`, `cryptography`
 
-## Installation
+## Instalación
 
 ```bash
-# Create and activate a virtual environment (recommended)
+# Crear y activar un entorno virtual (recomendado)
 python -m venv .venv
 # Windows
 .\.venv\Scripts\activate
 
-# Install dependencies
-pip install instaloader python-dotenv playwright cryptography
+# Instalar dependencias
+pip install -r requirements.txt
 
-# Install Playwright browser (Chromium)
+# Instalar navegador de Playwright (Chromium)
 python -m playwright install chromium
 ```
 
-Optional: if you prefer `pyproject.toml`, you can install with:
+Opcional: si prefieres `pyproject.toml`, puedes instalar con:
 
 ```bash
 pip install -e .
 ```
 
-> Note: Editable mode (`-e`) requires a build backend; this project includes a minimal `pyproject.toml`.
+> Nota: El modo editable (`-e`) requiere un backend de build; este proyecto incluye un `pyproject.toml` mínimo.
 
-## Usage
+## Uso
 
-### Facebook Authentication (OAuth)
+### Autenticación con Facebook (OAuth)
 
-1) Define variables in `.env`:
+1) Define variables en `.env`:
 
 ```
 FB_EMAIL=your_fb_email
@@ -52,43 +52,66 @@ AUTH_STORAGE_PLAIN_PATH=storage/storage_state.json
 LOG_LEVEL=INFO
 ```
 
-2) Run authentication:
+2) Ejecuta la autenticación:
 
 ```bash
 python main.py auth --headless false
 ```
 
-This opens the browser, clicks “Log in with Facebook”, fills credentials, handles 2FA if `FB_2FA_CODE` is set, and saves the session state (cookies and storage). If you set `AUTH_SECRET_KEY`, the file is encrypted.
+Esto abre el navegador, hace clic en “Iniciar sesión con Facebook”, completa credenciales, maneja 2FA si `FB_2FA_CODE` está definido y guarda el estado de sesión (cookies y storage). Si defines `AUTH_SECRET_KEY`, el archivo se cifra.
 
-Recent improvements:
-- Handles Instagram “Continue” / “Use another profile” screens automatically and accepts cookie banners.
-- If a valid session is detected after “Continue”, it saves storage without Facebook login.
-- On Facebook, it accepts cookie banners, waits for input visibility, uses alternate selectors, and applies JS fallbacks when overlays block interaction.
+Mejoras recientes:
+- Maneja automáticamente las pantallas de Instagram “Continuar” / “Usar otro perfil” y acepta banners de cookies.
+- Si se detecta una sesión válida tras “Continuar”, guarda el estado sin iniciar sesión en Facebook.
+- En Facebook, acepta banners de cookies, espera visibilidad de inputs, usa selectores alternativos y aplica fallbacks JS cuando overlays bloquean la interacción.
 
-### Scraping with Playwright Session
+### Scraping con sesión de Playwright
 
 ```bash
 python main.py scrape --url https://www.instagram.com/<username>/ --posts 5 --output profile.json
 ```
 
-Uses the authenticated session to query the `web_profile_info` API and fetch profile data and recent posts.
+Usa la sesión autenticada para consultar la API `web_profile_info` y obtener datos del perfil y publicaciones recientes.
 
-### Alternative Scraping with Instaloader
+### Scraping alternativo con Instaloader
 
 ```bash
 python main.py legacy --url https://www.instagram.com/<username>/ --posts 5 --output profile.json --login
 ```
 
-With `--login` you will use `IG_USERNAME`/`IG_PASSWORD` (and `IG_2FA_CODE` if applicable) from `.env`.
+Con `--login` se usarán `IG_USERNAME`/`IG_PASSWORD` (y `IG_2FA_CODE` si aplica) desde `.env`.
 
-Parameters:
-- `--url` (required): Instagram profile URL.
-- `--posts` (optional): number of recent posts to fetch (default 5).
-- `--output` (optional): output file path to save the JSON.
-- `--login` (optional, legacy): attempts login if credentials are provided.
+Parámetros:
+- `--url` (requerido): URL del perfil de Instagram.
+- `--posts` (opcional): número de publicaciones recientes a obtener (por defecto 5).
+- `--output` (opcional): ruta del archivo de salida para guardar el JSON.
+- `--login` (opcional, legacy): intenta login si se proveen credenciales.
 
-### Environment Variables (full)
-Create a `.env` at the project root:
+### Followers of Followers (Excel)
+
+Scrapea los seguidores de un perfil y, para cada uno, obtiene su cantidad de seguidores. Requiere sesión válida (ejecuta primero `auth`).
+
+```bash
+python main.py followers \
+  --url https://www.instagram.com/<username>/ \
+  --limit 50 \
+  --output storage/<username>_followers_counts.xlsx
+```
+
+- `--limit`: número máximo de seguidores del perfil a procesar.
+- `--page-size`: tamaño de página para la API de followers (por defecto 12).
+- `--chunk`: cuántos usuarios se consultan por bloque para conteo (recomendado 1–2 para evitar 429).
+- `--delay-ms`: pausa entre páginas/bloques en milisegundos (recomendado 5000–8000 bajo presión).
+- `--retry_tries` y `--retry_base_ms`: reintentos y backoff para llamadas web.
+- `--output`: si termina en `.xlsx`, exporta Excel con columnas `username`, `seguidores`, `primer_digito`; si falla la escritura, imprime JSON.
+
+Detalles de salida y logs:
+- `count`: número total de seguidores del perfil (no los procesados), obtenido desde `web_profile_info` cuando está disponible.
+- Logs imprimen líneas del tipo `Items recogidos (API|UI): N` y `username: followers` por cada item, además de `Count (followers del perfil): <num>`.
+- Cuando la API limita, el scraper cae a modo UI: abre el diálogo de seguidores, scrollea y extrae usernames; el conteo por usuario se obtiene via `web_profile_info` y, si falla, con lectura del `og:description` del perfil.
+
+### Variables de entorno (completo)
+Crea un `.env` en la raíz del proyecto:
 
 ```
 # Instagram (Instaloader)
@@ -112,9 +135,9 @@ AUTH_SECRET_KEY=base64_fernet_key
 LOG_LEVEL=INFO
 ```
 
-> Private profiles require login and viewing permissions.
+> Los perfiles privados requieren login y permisos de visualización.
 
-## Project Structure
+## Estructura del proyecto
 
 ```
 instagram-scraper/
@@ -133,40 +156,47 @@ instagram-scraper/
       └─ cli.py
 ```
 
-## Libraries and Rationale
+## Librerías y razones
 - `Playwright` (Python):
-  - Manages interactive OAuth flows (redirects to Facebook and returns to Instagram).
-  - Supports multi-page, multi-domain navigation with isolated contexts.
-  - Enables advanced scraping, including authenticated `fetch` from the browser context.
-  - Persists sessions by saving `storage_state` (cookies and localStorage), with encryption support.
+  - Gestiona flujos OAuth interactivos (redirige a Facebook y retorna a Instagram).
+  - Soporta navegación multi-página y multi-dominio con contextos aislados.
+  - Permite scraping avanzado, incluyendo `fetch` autenticado desde el contexto del navegador.
+  - Persiste sesiones guardando `storage_state` (cookies y localStorage), con soporte de cifrado.
 - `Instaloader`:
-  - Optimized alternative for scraping via Instagram’s internal APIs using direct credentials.
-  - Useful when OAuth is not needed.
+  - Alternativa optimizada para scraping vía APIs internas de Instagram usando credenciales directas.
+  - Útil cuando OAuth no es necesario.
 
-## Implementation Flow
-1. `auth`: open Instagram login, handle “Continue” / cookie banners, click “Log in with Facebook”, fill credentials and 2FA (if applicable), return to Instagram authenticated and save `storage_state` (cookies and storage). If `AUTH_SECRET_KEY` is set, the file is encrypted.
-2. `scrape`: decrypt and load `storage_state` if needed, create a context and call `https://www.instagram.com/api/v1/users/web_profile_info/?username=<user>` to fetch profile and posts.
-3. Export JSON with standard fields and a post list limited by `--posts` or `POSTS_LIMIT`.
+## Flujo de implementación
+1. `auth`: abre el login de Instagram, maneja “Continuar” / banners de cookies, hace clic en “Iniciar sesión con Facebook”, completa credenciales y 2FA (si aplica), regresa autenticado a Instagram y guarda `storage_state` (cookies y storage). Si `AUTH_SECRET_KEY` está definido, el archivo se cifra.
+2. `scrape`: descifra y carga `storage_state` si es necesario, crea un contexto y llama a `https://www.instagram.com/api/v1/users/web_profile_info/?username=<user>` para obtener perfil y publicaciones.
+3. Exporta JSON con campos estándar y lista de publicaciones limitada por `--posts` o `POSTS_LIMIT`.
 
-## Error Handling and Logs
-- Clear errors when required variables are missing (`FB_EMAIL`, `FB_PASSWORD`).
-- Validate `sessionid` cookie after login to confirm authentication.
-- Detailed logs with configurable `LOG_LEVEL`.
-- Explicit messages when 2FA is required; run with `HEADLESS=false` to manually intervene if needed.
+## Manejo de errores y logs
+- Errores claros cuando faltan variables requeridas (`FB_EMAIL`, `FB_PASSWORD`).
+- Validación de la cookie `sessionid` tras el login para confirmar autenticación.
+- Logs detallados con `LOG_LEVEL` configurable.
+- Mensajes explícitos cuando se requiere 2FA; ejecuta con `HEADLESS=false` para intervenir manualmente si es necesario.
 
-## Credential Security
-- Credentials in `.env` (not versioned due to `.gitignore`).
-- `AUTH_SECRET_KEY` enables Fernet encryption of the state file (`auth_state.enc`).
-- Session files in `storage/` are excluded by `.gitignore`.
+### Rate Limiting (HTTP 429)
+- Si ves 429, espera al menos 30–60 min; a veces 24–48 h.
+- Reduce el ritmo: `--chunk 1`, `--page-size 12`, `--delay-ms 5000–8000`.
+- No paralelices; procesa en bloques: `--limit 100` por corrida y continúa luego.
+- Cambia de IP si es necesario: red móvil/tethering, router con IP dinámica, proxies residenciales/móviles.
+- Mantén sesión autenticada para menos fricción; evita cerrar sesión/cookies.
 
-## Deployment Notes
-- Requires installing Playwright’s browser in the deployment environment (`python -m playwright install chromium`).
-- Set environment variables correctly and run `auth` before `scrape`.
+## Seguridad de credenciales
+- Credenciales en `.env` (no versionadas por `.gitignore`).
+- `AUTH_SECRET_KEY` habilita cifrado Fernet del archivo de estado (`auth_state.enc`).
+- Los archivos de sesión en `storage/` están excluidos por `.gitignore`.
 
-## Responsible Scraping
-- Respect Instagram and Facebook Terms of Service.
-- Use login only on accounts you control.
-- Avoid high request rates to prevent blocking.
+## Notas de despliegue
+- Requiere instalar el navegador de Playwright en el entorno de despliegue (`python -m playwright install chromium`).
+- Configura correctamente las variables de entorno y ejecuta `auth` antes de `scrape`.
 
-## License
-No specific license; adapt to your needs.
+## Scraping responsable
+- Respeta los Términos de Servicio de Instagram y Facebook.
+- Usa login solo en cuentas que controlas.
+- Evita tasas altas de solicitudes para prevenir bloqueos.
+
+## Licencia
+Sin licencia específica; adapta a tus necesidades.

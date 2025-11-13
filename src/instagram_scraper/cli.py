@@ -25,6 +25,16 @@ def build_parser() -> argparse.ArgumentParser:
     scrape_parser.add_argument("--posts", type=int, default=None, help="Cantidad de posts recientes (por defecto POSTS_LIMIT)")
     scrape_parser.add_argument("--output", type=Path, default=None, help="Archivo de salida JSON (opcional)")
 
+    followers_parser = subparsers.add_parser("followers", help="Listar seguidores y conteos de sus seguidores")
+    followers_parser.add_argument("--url", required=True, help="Enlace del perfil de Instagram")
+    followers_parser.add_argument("--limit", type=int, default=20, help="Cantidad de seguidores a consultar")
+    followers_parser.add_argument("--output", type=Path, default=None, help="Archivo de salida JSON (opcional)")
+    followers_parser.add_argument("--page-size", type=int, default=12, help="Tamaño de página para paginación")
+    followers_parser.add_argument("--chunk", type=int, default=2, help="Tamaño de lote para consultas de detalle")
+    followers_parser.add_argument("--delay-ms", type=int, default=3000, help="Retraso entre páginas/lotes en ms")
+    followers_parser.add_argument("--retry-tries", type=int, default=10, help="Intentos de reintento ante 429/0")
+    followers_parser.add_argument("--retry-base-ms", type=int, default=2500, help="Base de backoff en ms")
+
     # Subcomando de scraping con Instaloader (opcional)
     legacy_parser = subparsers.add_parser("legacy", help="Scrapear con Instaloader (login IG opcional)")
     legacy_parser.add_argument("--url", required=True, help="Enlace del perfil de Instagram")
@@ -53,6 +63,47 @@ def main() -> None:
     elif args.command == "scrape":
         scraper = BrowserInstagramScraper(config)
         data = scraper.get_profile_data(args.url, posts_limit=args.posts)
+    elif args.command == "followers":
+        import time as _t
+        t0 = _t.time()
+        scraper = BrowserInstagramScraper(config)
+        data = scraper.get_followers_counts_for_followers(
+            args.url,
+            followers_limit=args.limit,
+            page_size=args.page_size,
+            chunk=args.chunk,
+            delay_ms=args.delay_ms,
+            retry_tries=args.retry_tries,
+            retry_base_ms=args.retry_base_ms,
+        )
+        out_path = getattr(args, "output", None)
+        if out_path and out_path.suffix.lower() == ".xlsx":
+            rows = []
+            followers_items = data.get("followers_of_followers", [])
+            print(f"Items scrapeados: {len(followers_items)}")
+            for it in followers_items:
+                username = it.get("username")
+                followers = it.get("followers")
+                print(f"{username}: {followers}")
+                first_digit = None
+                if isinstance(followers, int):
+                    s = str(followers)
+                    first_digit = int(s[0]) if s else None
+                rows.append([username, followers if followers is not None else "", first_digit if first_digit is not None else ""])
+            try:
+                from openpyxl import Workbook
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "followers"
+                ws.append(["username", "seguidores", "primer_digito"])
+                for r in rows:
+                    ws.append(r)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                wb.save(str(out_path))
+                print(f"Archivo Excel guardado en {out_path}")
+                print(f"Tiempo total: {round(_t.time()-t0, 2)}s")
+            except Exception as e:
+                print(f"No se pudo escribir Excel (.xlsx): {e}. Se imprimirá JSON.")
     elif args.command == "legacy":
         scraper = InstagramScraper(config)
         if getattr(args, "login", False):
@@ -67,5 +118,8 @@ def main() -> None:
 
     out_path = getattr(args, "output", None)
     if out_path:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(output, encoding="utf-8")
+        if out_path.suffix.lower() == ".xlsx":
+            pass
+        else:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(output, encoding="utf-8")

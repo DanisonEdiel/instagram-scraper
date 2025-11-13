@@ -23,7 +23,11 @@ class BrowserInstagramScraper:
         limit = posts_limit or self.config.posts_limit
 
         with sync_playwright() as pw:
-            browser, context = self.auth.create_context_from_storage(pw)
+            try:
+                browser, context = self.auth.create_context_from_storage(pw)
+            except FileNotFoundError:
+                browser = pw.chromium.launch(headless=self.config.headless)
+                context = browser.new_context()
             page = context.new_page()
             try:
                 # Navega a la raíz para asegurar origen correcto
@@ -31,16 +35,14 @@ class BrowserInstagramScraper:
 
                 # Usa fetch desde el contexto para consultar la API web
                 logger.info("Consultando API web_profile_info para %s", username)
-                js = f"""
-                async function fetchProfile(username) {{
-                  const res = await fetch('https://www.instagram.com/api/v1/users/web_profile_info/?username=' + username, {{
-                    headers: {{'x-ig-app-id': '936619743392459'}}
-                  }});
-                  if (!res.ok) throw new Error('HTTP ' + res.status);
-                  return res.json();
-                }}
-                fetchProfile('{username}')
-                """
+                js = (
+                    "(async (u) => {\n"
+                    "  const url = 'https://www.instagram.com/api/v1/users/web_profile_info/?username=' + encodeURIComponent(u);\n"
+                    "  const res = await fetch(url, { headers: { 'x-ig-app-id': '936619743392459' } });\n"
+                    "  if (!res.ok) throw new Error('HTTP ' + res.status);\n"
+                    "  return res.json();\n"
+                    "})('" + username + "')"
+                )
                 result = page.evaluate(js)
 
                 user = result.get("data", {}).get("user")
@@ -52,9 +54,7 @@ class BrowserInstagramScraper:
                     "full_name": user.get("full_name"),
                     "biography": user.get("biography") or "",
                     "external_url": user.get("external_url"),
-                    "is_verified": bool(user.get("is_verified")),
                     "is_private": bool(user.get("is_private")),
-                    "profile_pic_url": user.get("profile_pic_url_hd") or user.get("profile_pic_url"),
                     "followers": user.get("edge_followed_by", {}).get("count"),
                     "following": user.get("edge_follow", {}).get("count"),
                     "posts_count": user.get("edge_owner_to_timeline_media", {}).get("count"),
@@ -80,6 +80,248 @@ class BrowserInstagramScraper:
                 data["latest_posts"] = latest_posts
                 return data
 
+            finally:
+                context.close()
+                browser.close()
+
+    def get_followers_counts_for_followers(
+        self,
+        profile_url: str,
+        followers_limit: Optional[int] = None,
+        page_size: int = 12,
+        chunk: int = 2,
+        delay_ms: int = 3000,
+        retry_tries: int = 10,
+        retry_base_ms: int = 2500,
+    ) -> Dict[str, Any]:
+        username = extract_username(profile_url)
+        limit = followers_limit or 20
+        with sync_playwright() as pw:
+            try:
+                browser, context = self.auth.create_context_from_storage(pw)
+            except FileNotFoundError:
+                browser = pw.chromium.launch(headless=self.config.headless)
+                context = browser.new_context()
+            page = context.new_page()
+            try:
+                page.goto("https://www.instagram.com/", timeout=30000)
+                logger.info("Consultando seguidores y conteos para %s", username)
+                try:
+                    cookies = context.cookies()
+                    has_session = any(c.get("name") == "sessionid" and c.get("value") for c in cookies)
+                    logger.info("Autenticado: %s", "sí" if has_session else "no")
+                    if not has_session:
+                        raise RuntimeError("No hay sesión autenticada (cookie sessionid ausente). Ejecute 'auth' primero.")
+                except Exception as e:
+                    logger.error("Estado de sesión desconocido: %s", e)
+                    raise
+                js = (
+                    "(async (u, total, pageSize, chunkSize, baseDelay, tries, baseRetryDelay) => {\n"
+                    "  function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }\n"
+                    "  async function fetchRetry(url, opts={}, triesParam=tries, delay=baseRetryDelay){\n"
+                    "    for (let i=0; i<triesParam; i++){\n"
+                    "      const res = await fetch(url, opts).catch(()=>null);\n"
+                    "      if (res && res.ok) return res;\n"
+                    "      const status = res ? res.status : 0;\n"
+                    "      if (status===429 || status===0){\n"
+                    "        const jitter = Math.floor(Math.random()*900);\n"
+                    "        await sleep(delay + jitter);\n"
+                    "        delay = Math.min(Math.floor(delay*1.7), 15000);\n"
+                    "        continue;\n"
+                    "      }\n"
+                    "      throw new Error('HTTP ' + status);\n"
+                    "    }\n"
+                    "    throw new Error('Too many retries');\n"
+                    "  }\n"
+                    "  const h = { 'x-ig-app-id': '936619743392459', 'x-requested-with': 'XMLHttpRequest', 'referer': location.origin + '/' };\n"
+                    "  const m = document.cookie.match(/csrftoken=([^;]+)/);\n"
+                    "  if (m) h['x-csrftoken'] = m[1];\n"
+                    "  const r1 = await fetchRetry('https://www.instagram.com/api/v1/users/web_profile_info/?username=' + encodeURIComponent(u), { headers: h });\n"
+                    "  const j1 = await r1.json();\n"
+                    "  const id = j1?.data?.user?.id;\n"
+                    "  if (!id) throw new Error('no id');\n"
+                    "  const totalFollowers = j1?.data?.user?.edge_followed_by?.count ?? null;\n"
+                    "  let max_id = undefined;\n"
+                    "  let users = [];\n"
+                    "  for (;;) {\n"
+                    "    const url = new URL('https://www.instagram.com/api/v1/friendships/' + id + '/followers/');\n"
+                    "    url.searchParams.set('count', String(pageSize));\n"
+                    "    if (max_id) url.searchParams.set('max_id', max_id);\n"
+                    "    const r2 = await fetchRetry(url.toString(), { headers: h });\n"
+                    "    const j2 = await r2.json();\n"
+                    "    users = users.concat(j2?.users || []);\n"
+                    "    max_id = j2?.next_max_id;\n"
+                    "    if (!max_id || users.length >= total) break;\n"
+                    "    await sleep(baseDelay);\n"
+                    "  }\n"
+                    "  users = users.slice(0, total);\n"
+                    "  const out = [];\n"
+                    "  for (let i = 0; i < users.length; i += chunkSize) {\n"
+                    "    const part = users.slice(i, i + chunkSize);\n"
+                    "    const results = await Promise.all(part.map(async it => {\n"
+                    "      try {\n"
+                    "        const r3 = await fetchRetry('https://www.instagram.com/api/v1/users/web_profile_info/?username=' + encodeURIComponent(it.username));\n"
+                    "        const j3 = await r3.json();\n"
+                    "        const c = j3?.data?.user?.edge_followed_by?.count ?? null;\n"
+                    "        return { username: it.username, followers: c };\n"
+                    "      } catch (e) {\n"
+                    "        return { username: it.username, followers: null };\n"
+                    "      }\n"
+                    "    }));\n"
+                    "    out.push(...results);\n"
+                    "    await sleep(baseDelay);\n"
+                    "  }\n"
+                    "  return { username: j1?.data?.user?.username, count: totalFollowers, scraped_count: out.length, followers_of_followers: out };\n"
+                    "})('" + username + "', " + str(limit) + ", " + str(page_size) + ", " + str(chunk) + ", " + str(delay_ms) + ", " + str(retry_tries) + ", " + str(retry_base_ms) + ")"
+                )
+                try:
+                    result = page.evaluate(js)
+                    try:
+                        items = result.get("followers_of_followers", [])
+                        logger.info("Items recogidos (API): %d", len(items))
+                        for it in items[:50]:
+                            logger.info("%s: %s", it.get("username"), str(it.get("followers")))
+                        logger.info("Count (followers del perfil): %s", str(result.get("count")))
+                    except Exception:
+                        pass
+                    return result
+                except Exception:
+                    # Fallback por UI: abrir modal de seguidores y scroll para recolectar usernames
+                    page.goto(f"https://www.instagram.com/{username}/", timeout=30000)
+                    try:
+                        jscode_count = (
+                            "(async (u) => {\n"
+                            "  try {\n"
+                            "    const h = { 'x-ig-app-id': '936619743392459' };\n"
+                            "    const r = await fetch('https://www.instagram.com/api/v1/users/web_profile_info/?username=' + encodeURIComponent(u), { headers: h });\n"
+                            "    const j = await r.json();\n"
+                            "    return j?.data?.user?.edge_followed_by?.count ?? null;\n"
+                            "  } catch(e) { return null; }\n"
+                            "})('" + username + "')"
+                        )
+                        count_val = page.evaluate(jscode_count)
+                    except Exception:
+                        count_val = None
+                    try:
+                        for btn in [
+                            page.get_by_role("button", name="Permitir todas las cookies").first,
+                            page.get_by_role("button", name="Allow all cookies").first,
+                            page.get_by_role("button", name="Aceptar").first,
+                        ]:
+                            if btn.is_visible():
+                                btn.click()
+                                break
+                    except Exception:
+                        pass
+                    page.wait_for_selector("a[href$='/followers/']", timeout=20000)
+                    page.locator("a[href$='/followers/']").first.click()
+                    page.wait_for_selector("div[role='dialog']", timeout=20000)
+                    usernames: List[str] = []
+                    last_len = -1
+                    # Extrae usernames usando JS dentro del diálogo y scrollea hasta alcanzar el límite o no haya nuevos
+                    while len(usernames) < limit:
+                        try:
+                            found = page.evaluate(
+                                "(() => {\n"
+                                "  const dlg = document.querySelector('div[role=\"dialog\"]');\n"
+                                "  if (!dlg) return [];\n"
+                                "  const anchors = Array.from(dlg.querySelectorAll('a[href^=\"/\"][href$=\"/\"]'));\n"
+                                "  const out = [];\n"
+                                "  for (const a of anchors) {\n"
+                                "    const href = a.getAttribute('href') || '';\n"
+                                "    const m = href.match(/^\\/([A-Za-z0-9._]+)\\/$/);\n"
+                                "    if (m) out.push(m[1]);\n"
+                                "  }\n"
+                                "  return Array.from(new Set(out));\n"
+                                "})()"
+                            )
+                        except Exception:
+                            found = []
+                        try:
+                            logger.info("Usernames visibles en diálogo: %d", len(found))
+                        except Exception:
+                            pass
+                        for uname in found:
+                            if uname not in usernames:
+                                usernames.append(uname)
+                                if len(usernames) >= limit:
+                                    break
+                        if len(usernames) == last_len:
+                            break
+                        last_len = len(usernames)
+                        try:
+                            page.evaluate(
+                                "(() => {\n"
+                                "  const dlg = document.querySelector('div[role=\"dialog\"]');\n"
+                                "  if (!dlg) return false;\n"
+                                "  const nodes = [dlg, ...Array.from(dlg.querySelectorAll('*'))];\n"
+                                "  const sc = nodes.find(n => (n.scrollHeight||0) > (n.clientHeight||0));\n"
+                                "  if (!sc) return false;\n"
+                                "  sc.scrollTop = sc.scrollHeight;\n"
+                                "  return true;\n"
+                                "})()"
+                            )
+                        except Exception:
+                            page.mouse.wheel(0, 3000)
+                        page.wait_for_timeout(1200)
+
+                    out: List[Dict[str, Any]] = []
+                    for uname in usernames[:limit]:
+                        jscode = (
+                            "(async (u, tries, baseDelay) => {\n"
+                            "  function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }\n"
+                            "  async function fetchRetry(url, opts={}, triesParam=tries, delay=baseDelay){\n"
+                            "    for (let i=0; i<triesParam; i++){\n"
+                            "      const res = await fetch(url, opts).catch(()=>null);\n"
+                            "      if (res && res.ok) return res;\n"
+                            "      const status = res ? res.status : 0;\n"
+                            "      if (status===429 || status===0){ const jitter=Math.floor(Math.random()*900); await sleep(delay+jitter); delay=Math.min(Math.floor(delay*1.7),15000); continue;}\n"
+                            "      throw new Error('HTTP ' + status);\n"
+                            "    }\n"
+                            "    throw new Error('Too many retries');\n"
+                            "  }\n"
+                            "  const h = { 'x-ig-app-id': '936619743392459', 'x-requested-with': 'XMLHttpRequest', 'referer': location.origin + '/' };\n"
+                            "  const m = document.cookie.match(/csrftoken=([^;]+)/);\n"
+                            "  if (m) h['x-csrftoken'] = m[1];\n"
+                            "  const r = await fetchRetry('https://www.instagram.com/api/v1/users/web_profile_info/?username=' + encodeURIComponent(u), { headers: h });\n"
+                            "  const j = await r.json();\n"
+                            "  const c = j?.data?.user?.edge_followed_by?.count ?? null;\n"
+                            "  return { username: u, followers: c };\n"
+                            ")('" + uname + "', " + str(retry_tries) + ", " + str(retry_base_ms) + ")"
+                        )
+                        try:
+                            item = page.evaluate(jscode)
+                            out.append(item)
+                            page.wait_for_timeout(1000)
+                        except Exception:
+                            out.append({"username": uname, "followers": None})
+                            page.wait_for_timeout(1500)
+                        if out[-1].get("followers") is None:
+                            try:
+                                page.goto(f"https://www.instagram.com/{uname}/", timeout=30000)
+                                page.wait_for_selector("meta[property='og:description']", timeout=15000)
+                                meta_val = page.evaluate(
+                                    "(() => {\n"
+                                    "  const m = document.querySelector('meta[property=\"og:description\"]');\n"
+                                    "  const t = m ? (m.getAttribute('content')||'') : '';\n"
+                                    "  const re = /([0-9.,]+)\s*(followers|seguidores)/i;\n"
+                                    "  const mm = t.match(re);\n"
+                                    "  if (!mm) return null;\n"
+                                    "  const num = mm[1].replace(/[.,\s]/g,'');\n"
+                                    "  return Number(num)||null;\n"
+                                    "})()"
+                                )
+                                out[-1] = {"username": uname, "followers": meta_val}
+                            except Exception:
+                                pass
+                    try:
+                        logger.info("Items recogidos (UI): %d", len(out))
+                        for it in out[:50]:
+                            logger.info("%s: %s", it.get("username"), str(it.get("followers")))
+                        logger.info("Count (followers del perfil): %s", str(count_val))
+                    except Exception:
+                        pass
+                    return {"username": username, "count": count_val, "followers_of_followers": out}
             finally:
                 context.close()
                 browser.close()
