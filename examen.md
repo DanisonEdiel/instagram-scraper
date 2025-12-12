@@ -12,7 +12,7 @@
 - Onboarding: chips de categorías detectadas para que el usuario confirme.
 - Feed: mezcla de “lo que sigues” con descubrimiento de creadores similares.
 - Insights: gráfico simple por categorías y top cuentas por actividad.
-- Colecciones: guardar en boards tipo “Tipografía” y “Publicidad crítica”.
+- Guardar en boards tipo “Tipografía” y “Publicidad crítica”.
 - Red lenta (3–10 Mbps): miniaturas progresivas y sin autoplay por defecto.
 - Control: transparencia de inferencias y opción de excluir categorías/cuentas.
 

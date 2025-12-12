@@ -193,14 +193,130 @@ class BrowserInstagramScraper:
                 if not force_ui:
                     try:
                         result = page.evaluate(js)
-                        try:
-                            items = result.get("following_details", [])
-                            logger.info("Items recogidos (API): %d", len(items))
-                            for it in items[:50]:
-                                logger.info("%s: %s seguidos=%s", it.get("username"), str(it.get("followers")), str(it.get("following")))
-                            logger.info("Count (seguidos del perfil): %s", str(result.get("following_count")))
-                        except Exception:
-                            pass
+                        items = result.get("following_details", []) or []
+                        logger.info("Items recogidos (API): %d", len(items))
+                        # Enriquecimiento: para cualquier item con campos vacíos, intenta HTML y luego DOM.
+                        enriched: List[Dict[str, Any]] = []
+                        for it in items:
+                            uname = it.get("username") or ""
+                            before = {
+                                "full_name": it.get("full_name"),
+                                "biography": it.get("biography"),
+                                "followers": it.get("followers"),
+                                "following": it.get("following"),
+                            }
+                            need_fb = (not it.get("full_name")) or (it.get("followers") is None) or (it.get("following") is None) or (not it.get("biography"))
+                            used_html = False
+                            used_dom = False
+                            if need_fb and uname:
+                                # 1) Intento rápido vía HTML (og tags)
+                                fb_js = (
+                                    "(async (u, tries, baseDelay) => {\n"
+                                    "  function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }\n"
+                                    "  async function fetchRetry(url, opts={}, triesParam=tries, delay=baseDelay){\n"
+                                    "    for (let i=0; i<triesParam; i++){\n"
+                                    "      const res = await fetch(url, opts).catch(()=>null);\n"
+                                    "      if (res && res.ok) return res;\n"
+                                    "      const status = res ? res.status : 0;\n"
+                                    "      if (status===429 || status===0){ const jitter=Math.floor(Math.random()*900); await sleep(delay+jitter); delay=Math.min(Math.floor(delay*1.7),15000); continue;}\n"
+                                    "      throw new Error('HTTP ' + status);\n"
+                                    "    }\n"
+                                    "    throw new Error('Too many retries');\n"
+                                    "  }\n"
+                                    "  const h = { 'x-requested-with': 'XMLHttpRequest', 'referer': location.origin + '/' };\n"
+                                    "  const r = await fetchRetry(location.origin + '/' + u + '/', { headers: h });\n"
+                                    "  const html = await r.text();\n"
+                                    "  const doc = new DOMParser().parseFromString(html, 'text/html');\n"
+                                    "  function parseNum(txt){\n"
+                                    "    if (!txt) return null;\n"
+                                    "    const t = String(txt).trim();\n"
+                                    "    const m = t.match(/([0-9.,]+)\\s*(k|m|K|M|mil|millones|millon|millón)?/i);\n"
+                                    "    if (!m) return null;\n"
+                                    "    let n = m[1].replace(/\\s/g,'');\n"
+                                    "    n = n.replace(/\\.(?=\\d{3}\\b)/g,'');\n"
+                                    "    n = n.replace(/,(?=\\d{3}\\b)/g,'');\n"
+                                    "    let val = Number(n.replace(',', '.'));\n"
+                                    "    const suf = m[2] ? m[2].toLowerCase() : '';\n"
+                                    "    if (suf==='k') val = Math.round(val*1000);\n"
+                                    "    if (suf==='m') val = Math.round(val*1000000);\n"
+                                    "    if (suf==='mil') val = Math.round(val*1000);\n"
+                                    "    if (suf==='millones' || suf==='millon' || suf==='millón') val = Math.round(val*1000000);\n"
+                                    "    return Number.isFinite(val) ? val : null;\n"
+                                    "  }\n"
+                                    "  let fullName = null;\n"
+                                    "  const metaTitle = doc.querySelector('meta[property=\"og:title\"]');\n"
+                                    "  if (metaTitle) { const t = metaTitle.getAttribute('content')||''; const mt = t.match(/^(.+?)\\s\\(@/); if (mt) fullName = mt[1].trim(); }\n"
+                                    "  let followers = null, following = null;\n"
+                                    "  const mdesc = doc.querySelector('meta[property=\"og:description\"]');\n"
+                                    "  if (mdesc) { const t = mdesc.getAttribute('content')||''; const mf = t.match(/([0-9.,]+)\\s*(followers|seguidores)/i); const mg = t.match(/([0-9.,]+)\\s*(following|seguidos)/i); if (mf) followers = parseNum(mf[1]); if (mg) following = parseNum(mg[1]); }\n"
+                                    "  // Intento simple de bio\n"
+                                    "  let biography = '';\n"
+                                    "  const bioMeta = doc.querySelector('[data-testid=\"user-bio\"]');\n"
+                                    "  if (bioMeta) { const t = bioMeta.textContent||bioMeta.innerText||''; if (t && t.trim().length>=3) biography = t.trim(); }\n"
+                                    "  return { full_name: fullName, biography, followers, following };\n"
+                                    ")('" + uname + "', " + str(retry_tries) + ", " + str(retry_base_ms) + ")"
+                                )
+                                try:
+                                    fb = page.evaluate(fb_js)
+                                    used_html = True
+                                    if not it.get("full_name") and fb.get("full_name"):
+                                        it["full_name"] = fb.get("full_name")
+                                    if (it.get("followers") is None) and (fb.get("followers") is not None):
+                                        it["followers"] = fb.get("followers")
+                                    if (it.get("following") is None) and (fb.get("following") is not None):
+                                        it["following"] = fb.get("following")
+                                    if not it.get("biography") and fb.get("biography"):
+                                        it["biography"] = fb.get("biography")
+                                except Exception:
+                                    pass
+                                # 2) Si sigue faltando algo crítico, intenta DOM navegando al perfil
+                                if (not it.get("full_name")) or (it.get("followers") is None) or (it.get("following") is None) or (not it.get("biography")):
+                                    try:
+                                        page.goto(f"https://www.instagram.com/{uname}/", timeout=30000)
+                                        page.wait_for_load_state("domcontentloaded")
+                                        page.wait_for_timeout(500)
+                                        dom_vals = page.evaluate(
+                                            "(() => {\n"
+                                            "  function parseNum(txt){ if (!txt) return null; const t=String(txt).trim(); const m=t.match(/([0-9.,]+)\\s*(k|m|K|M|mil|millones|millon|millón)?/i); if(!m) return null; let n=m[1].replace(/\\s/g,''); n=n.replace(/\\.(?=\\d{3}\\b)/g,''); n=n.replace(/,(?=\\d{3}\\b)/g,''); let val=Number(n.replace(',', '.')); const suf=m[2]?m[2].toLowerCase():''; if(suf==='k') val=Math.round(val*1000); if(suf==='m') val=Math.round(val*1000000); if(suf==='mil') val=Math.round(val*1000); if(suf==='millones'||suf==='millon'||suf==='millón') val=Math.round(val*1000000); return Number.isFinite(val)?val:null; }\n"
+                                            "  function grabText(el){ if(!el) return ''; return el.textContent||el.innerText||el.getAttribute('title')||el.getAttribute('aria-label')||''; }\n"
+                                            "  let fullName=null; const mt=document.querySelector('meta[property=\"og:title\"]'); if(mt){ const t=mt.getAttribute('content')||''; const mm=t.match(/^(.+?)\\s\\(@/); if(mm) fullName=mm[1].trim(); } if(!fullName){ const nameEl=document.querySelector('header h1, header h2'); if(nameEl){ const nt=grabText(nameEl).trim(); if(nt) fullName=nt; } }\n"
+                                            "  let followers=null, following=null; const md=document.querySelector('meta[property=\"og:description\"]'); if(md){ const t=md.getAttribute('content')||''; const mf=t.match(/([0-9.,]+)\\s*(followers|seguidores)/i); const mg=t.match(/([0-9.,]+)\\s*(following|seguidos)/i); if(mf) followers=parseNum(mf[1]); if(mg) following=parseNum(mg[1]); }\n"
+                                            "  if(followers===null){ const aF=document.querySelector('header section ul li a[href$=\"/followers/\"]'); if(aF){ const v=parseNum(grabText(aF)); if(v!==null) followers=v; } }\n"
+                                            "  if(following===null){ const aG=document.querySelector('header section ul li a[href$=\"/following/\"]'); if(aG){ const v=parseNum(grabText(aG)); if(v!==null) following=v; } }\n"
+                                            "  let biography=''; const bioCandidates=Array.from(document.querySelectorAll('[data-testid=\"user-bio\"], header section div, header section p')); for(const el of bioCandidates){ const txt=grabText(el).trim(); if(txt && !/[0-9.,]+\\s*(followers|seguidores|following|seguidos)/i.test(txt) && txt.length>=8){ biography=txt; break; } }\n"
+                                            "  return { full_name: fullName, biography, followers, following };\n"
+                                            "})()"
+                                        )
+                                        used_dom = True
+                                        if not it.get("full_name") and dom_vals.get("full_name"):
+                                            it["full_name"] = dom_vals.get("full_name")
+                                        if (it.get("followers") is None) and (dom_vals.get("followers") is not None):
+                                            it["followers"] = dom_vals.get("followers")
+                                        if (it.get("following") is None) and (dom_vals.get("following") is not None):
+                                            it["following"] = dom_vals.get("following")
+                                        if not it.get("biography") and dom_vals.get("biography"):
+                                            it["biography"] = dom_vals.get("biography")
+                                    except Exception:
+                                        pass
+                            after = {
+                                "full_name": it.get("full_name"),
+                                "biography": it.get("biography"),
+                                "followers": it.get("followers"),
+                                "following": it.get("following"),
+                            }
+                            logger.info(
+                                "%s | API=%s | HTML=%s | DOM=%s | final: nombre=%s, seguidores=%s, seguidos=%s",
+                                uname,
+                                str(before),
+                                str(used_html),
+                                str(used_dom),
+                                after.get("full_name"),
+                                str(after.get("followers")),
+                                str(after.get("following")),
+                            )
+                            enriched.append(it)
+                        result["following_details"] = enriched
+                        logger.info("Count (seguidos del perfil): %s", str(result.get("following_count")))
                         return result
                     except Exception:
                         pass
@@ -268,6 +384,34 @@ class BrowserInstagramScraper:
                             )
                         except Exception:
                             found = []
+                        # Extra: intenta capturar nombres visibles en el diálogo para usar como fallback de full_name
+                        try:
+                            dialog_names = page.evaluate(
+                                "(() => {\n"
+                                "  const dlg = document.querySelector('div[role=\"dialog\"]');\n"
+                                "  const base = dlg || document;\n"
+                                "  const anchors = Array.from(base.querySelectorAll('a[href^=\"/\"][href$=\"/\"]'));\n"
+                                "  const map = {};\n"
+                                "  for (const a of anchors){\n"
+                                "    const href = a.getAttribute('href')||'';\n"
+                                "    const m = href.match(/^\\/([A-Za-z0-9._]+)\\/$/);\n"
+                                "    if (!m) continue;\n"
+                                "    const uname = m[1];\n"
+                                "    const container = a.closest('li, div') || a.parentElement;\n"
+                                "    let txt = '';\n"
+                                "    if (container){ txt = (container.textContent||'').trim(); }\n"
+                                "    // Limpia etiquetas de botones y estados\n"
+                                "    txt = txt.replace(/Seguir|Siguiendo|Follow|Following|Message|Mensaje/gi, '').trim();\n"
+                                "    // Busca la primera línea que parezca nombre (contiene espacios y letras)\n"
+                                "    const lines = txt.split(/\n+/).map(s => s.trim()).filter(Boolean);\n"
+                                "    const cand = lines.find(s => /[A-Za-zÁÉÍÓÚáéíóúÑñ]+\s+[A-Za-zÁÉÍÓÚáéíóúÑñ]+/.test(s)) || lines[0] || '';\n"
+                                "    if (cand && cand.length>=3) map[uname] = cand;\n"
+                                "  }\n"
+                                "  return map;\n"
+                                "})()"
+                            )
+                        except Exception:
+                            dialog_names = {}
                         for uname in found:
                             if uname not in usernames:
                                 usernames.append(uname)
@@ -284,6 +428,10 @@ class BrowserInstagramScraper:
 
                     out: List[Dict[str, Any]] = []
                     for uname in usernames[:limit]:
+                        try:
+                            logger.info("Procesando usuario desde UI: %s", uname)
+                        except Exception:
+                            pass
                         jscode = (
                             "(async (u, tries, baseDelay) => {\n"
                             "  function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }\n"
@@ -309,6 +457,12 @@ class BrowserInstagramScraper:
                         )
                         try:
                             item = page.evaluate(jscode)
+                            # Fallback inmediato: si falta full_name y tenemos nombre del diálogo, úsalo
+                            try:
+                                if (not item.get("full_name")) and dialog_names.get(uname):
+                                    item["full_name"] = dialog_names.get(uname)
+                            except Exception:
+                                pass
                             # Si el API devuelve campos críticos vacíos, intenta fallback HTML y fusiona.
                             needs_fb = (item.get("followers") is None and item.get("following") is None) or (not item.get("full_name"))
                             if needs_fb:
@@ -332,7 +486,7 @@ class BrowserInstagramScraper:
                                     "  function parseNum(txt){\n"
                                     "    if (!txt) return null;\n"
                                     "    const t = String(txt).trim();\n"
-                                    "    const m = t.match(/([0-9.,]+)\\s*([kKmM])?/);\n"
+                                    "    const m = t.match(/([0-9.,]+)\\s*(k|m|K|M|mil|millones|millon|millón)?/i);\n"
                                     "    if (!m) return null;\n"
                                     "    let n = m[1].replace(/\\s/g,'');\n"
                                     "    n = n.replace(/\\.(?=\\d{3}\\b)/g,'');\n"
@@ -341,6 +495,8 @@ class BrowserInstagramScraper:
                                     "    const suf = m[2] ? m[2].toLowerCase() : '';\n"
                                     "    if (suf==='k') val = Math.round(val*1000);\n"
                                     "    if (suf==='m') val = Math.round(val*1000000);\n"
+                                    "    if (suf==='mil') val = Math.round(val*1000);\n"
+                                    "    if (suf==='millones' || suf==='millon' || suf==='millón') val = Math.round(val*1000000);\n"
                                     "    return Number.isFinite(val) ? val : null;\n"
                                     "  }\n"
                                     "  let fullName = null;\n"
@@ -379,6 +535,18 @@ class BrowserInstagramScraper:
                                 if (item.get("followers") is None or item.get("following") is None) or (not item.get("full_name")):
                                     try:
                                         page.goto(f"https://www.instagram.com/{uname}/", timeout=30000)
+                                        # Intenta cerrar/aceptar cookies en el perfil si aparecen
+                                        try:
+                                            for btn in [
+                                                page.get_by_role("button", name="Permitir todas las cookies").first,
+                                                page.get_by_role("button", name="Allow all cookies").first,
+                                                page.get_by_role("button", name="Aceptar").first,
+                                            ]:
+                                                if btn.is_visible():
+                                                    btn.click()
+                                                    break
+                                        except Exception:
+                                            pass
                                         page.wait_for_load_state("domcontentloaded")
                                         try:
                                             page.wait_for_selector(
@@ -393,7 +561,7 @@ class BrowserInstagramScraper:
                                             "  function parseNum(txt){\n"
                                             "    if (!txt) return null;\n"
                                             "    const t = String(txt).trim();\n"
-                                            "    const m = t.match(/([0-9.,]+)\\s*([kKmM])?/);\n"
+                                            "    const m = t.match(/([0-9.,]+)\\s*(k|m|K|M|mil|millones|millon|millón)?/i);\n"
                                             "    if (!m) return null;\n"
                                             "    let n = m[1].replace(/\\s/g,'');\n"
                                             "    n = n.replace(/\\.(?=\\d{3}\\b)/g,'');\n"
@@ -402,6 +570,8 @@ class BrowserInstagramScraper:
                                             "    const suf = m[2] ? m[2].toLowerCase() : '';\n"
                                             "    if (suf==='k') val = Math.round(val*1000);\n"
                                             "    if (suf==='m') val = Math.round(val*1000000);\n"
+                                            "    if (suf==='mil') val = Math.round(val*1000);\n"
+                                            "    if (suf==='millones' || suf==='millon' || suf==='millón') val = Math.round(val*1000000);\n"
                                             "    return Number.isFinite(val) ? val : null;\n"
                                             "  }\n"
                                             "  function grabText(el){\n"
@@ -411,8 +581,8 @@ class BrowserInstagramScraper:
                                             "  let fullName = null;\n"
                                             "  const mt = document.querySelector('meta[property=\"og:title\"]');\n"
                                             "  if (mt) { const t = mt.getAttribute('content')||''; const mmm = t.match(/^(.+?)\\s\\(@/); if (mmm) fullName = mmm[1].trim(); }\n"
+                                            "  if (!fullName){ const nameEl = document.querySelector('header h1, header h2'); if (nameEl){ const nt = grabText(nameEl).trim(); if (nt) fullName = nt; } }\n"
                                             "  let followers = null, following = null;\n"
-                                            "  // Primero intenta con og:description\n"
                                             "  const mdesc = document.querySelector('meta[property=\"og:description\"]');\n"
                                             "  if (mdesc) {\n"
                                             "    const t = mdesc.getAttribute('content')||'';\n"
@@ -422,18 +592,25 @@ class BrowserInstagramScraper:
                                             "    if (mf) followers = parseNum(mf[1]);\n"
                                             "    if (mg) following = parseNum(mg[1]);\n"
                                             "  }\n"
-                                            "  // Si aún falta, intenta leer del DOM de cabecera con múltiples selectores\n"
                                             "  if (followers===null){\n"
-                                            "    const selFStr = `a[href$='/followers/'] span[title], a[href$='/followers/'] span, a[href$='/followers/'] div, header section ul li a[href$='/followers/'] span[title], header section ul li a[href$='/followers/'] span, li a[href$='/followers/']`;\n"
+                                            "    const selFStr = `a[href$='/followers/'] span[title], a[href$='/followers/'] span, a[href$='/followers/'] div, header section ul li a[href$='/followers/'] span[title], header section ul li a[href$='/followers/'] span, li a[href$='/followers/'], header section ul li a[href$='/followers/']`;\n"
                                             "    const selsF = selFStr.split(/\\s*,\\s*/);\n"
                                             "    for (const s of selsF){ const el = document.querySelector(s); if (el){ const v = parseNum(grabText(el)); if (v!==null){ followers = v; break; } } }\n"
+                                            "    if (followers===null){ const aF = document.querySelector('header section ul li a[href$=\"/followers/\"]'); if (aF){ const v = parseNum(grabText(aF)); if (v!==null) followers = v; } }\n"
                                             "  }\n"
                                             "  if (following===null){\n"
-                                            "    const selFgStr = `a[href$='/following/'] span[title], a[href$='/following/'] span, a[href$='/following/'] div, header section ul li a[href$='/following/'] span[title], header section ul li a[href$='/following/'] span, li a[href$='/following/']`;\n"
+                                            "    const selFgStr = `a[href$='/following/'] span[title], a[href$='/following/'] span, a[href$='/following/'] div, header section ul li a[href$='/following/'] span[title], header section ul li a[href$='/following/'] span, li a[href$='/following/'], header section ul li a[href$='/following/']`;\n"
                                             "    const selsFg = selFgStr.split(/\\s*,\\s*/);\n"
                                             "    for (const s of selsFg){ const el = document.querySelector(s); if (el){ const v = parseNum(grabText(el)); if (v!==null){ following = v; break; } } }\n"
+                                            "    if (following===null){ const aFg = document.querySelector('header section ul li a[href$=\"/following/\"]'); if (aFg){ const v = parseNum(grabText(aFg)); if (v!==null) following = v; } }\n"
                                             "  }\n"
-                                            "  return { full_name: fullName, followers, following };\n"
+                                            "  let biography = '';\n"
+                                            "  const bioCandidates = Array.from(document.querySelectorAll('[data-testid=\"user-bio\"], header section div, header section p'));\n"
+                                            "  for (const el of bioCandidates){\n"
+                                            "    const txt = grabText(el).trim();\n"
+                                            "    if (txt && !/[0-9.,]+\\s*(followers|seguidores|following|seguidos)/i.test(txt) && txt.length >= 8){ biography = txt; break; }\n"
+                                            "  }\n"
+                                            "  return { full_name: fullName, biography, followers, following };\n"
                                             "})()"
                                         )
                                         if not item.get("full_name") and dom_vals.get("full_name"):
@@ -444,9 +621,22 @@ class BrowserInstagramScraper:
                                             item["following"] = dom_vals.get("following")
                                     except Exception:
                                         pass
+                            # Log final por usuario en modo UI
+                            try:
+                                logger.info(
+                                    "[UI] %s | nombre='%s' | bio_len=%s | seguidores=%s | seguidos=%s",
+                                    uname,
+                                    item.get("full_name") or "",
+                                    len(item.get("biography") or ""),
+                                    str(item.get("followers")),
+                                    str(item.get("following")),
+                                )
+                            except Exception:
+                                pass
                             out.append(item)
                         except Exception:
-                            # Fallback: lee la página del perfil y extrae conteos desde og:description y nombre desde og:title
+                            # Fallback: lee la página del perfil y extrae conteos desde og:description y nombre desde og:title;
+                            # además, si aún faltan datos, navega al DOM del perfil y completa.
                             fb_js = (
                                 "(async (u, tries, baseDelay) => {\n"
                                 "  function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }\n"
@@ -467,7 +657,7 @@ class BrowserInstagramScraper:
                                 "  function parseNum(txt){\n"
                                 "    if (!txt) return null;\n"
                                 "    const t = String(txt).trim();\n"
-                                "    const m = t.match(/([0-9.,]+)\\s*([kKmM])?/);\n"
+                                "    const m = t.match(/([0-9.,]+)\\s*(k|m|K|M|mil|millones|millon|millón)?/i);\n"
                                 "    if (!m) return null;\n"
                                 "    let n = m[1].replace(/\\s/g,'');\n"
                                 "    n = n.replace(/\\.(?=\\d{3}\\b)/g,'');\n"
@@ -476,6 +666,8 @@ class BrowserInstagramScraper:
                                 "    const suf = m[2] ? m[2].toLowerCase() : '';\n"
                                 "    if (suf==='k') val = Math.round(val*1000);\n"
                                 "    if (suf==='m') val = Math.round(val*1000000);\n"
+                                "    if (suf==='mil') val = Math.round(val*1000);\n"
+                                "    if (suf==='millones' || suf==='millon' || suf==='millón') val = Math.round(val*1000000);\n"
                                 "    return Number.isFinite(val) ? val : null;\n"
                                 "  }\n"
                                 "  let fullName = null;\n"
@@ -500,7 +692,55 @@ class BrowserInstagramScraper:
                                 ")('" + uname + "', " + str(retry_tries) + ", " + str(retry_base_ms) + ")"
                             )
                             try:
-                                out.append(page.evaluate(fb_js))
+                                fb_item = page.evaluate(fb_js)
+                                # Si aún faltan datos críticos, navega al perfil y raspa del DOM
+                                if (fb_item.get("followers") is None or fb_item.get("following") is None or not fb_item.get("full_name")):
+                                    try:
+                                        page.goto(f"https://www.instagram.com/{uname}/", timeout=30000)
+                                        page.wait_for_load_state("domcontentloaded")
+                                        try:
+                                            for btn in [
+                                                page.get_by_role("button", name="Permitir todas las cookies").first,
+                                                page.get_by_role("button", name="Allow all cookies").first,
+                                                page.get_by_role("button", name="Aceptar").first,
+                                            ]:
+                                                if btn.is_visible():
+                                                    btn.click()
+                                                    break
+                                        except Exception:
+                                            pass
+                                        page.wait_for_timeout(800)
+                                        dom_vals = page.evaluate(
+                                            "(() => {\n"
+                                            "  function parseNum(txt){ if (!txt) return null; const t=String(txt).trim(); const m=t.match(/([0-9.,]+)\\s*(k|m|K|M|mil|millones|millon|millón)?/i); if(!m) return null; let n=m[1].replace(/\\s/g,''); n=n.replace(/\\.(?=\\d{3}\\b)/g,''); n=n.replace(/,(?=\\d{3}\\b)/g,''); let val=Number(n.replace(',', '.')); const suf=m[2]?m[2].toLowerCase():''; if(suf==='k') val=Math.round(val*1000); if(suf==='m') val=Math.round(val*1000000); if(suf==='mil') val=Math.round(val*1000); if(suf==='millones'||suf==='millon'||suf==='millón') val=Math.round(val*1000000); return Number.isFinite(val)?val:null; }\n"
+                                            "  function grabText(el){ if(!el) return ''; return el.textContent||el.innerText||el.getAttribute('title')||el.getAttribute('aria-label')||''; }\n"
+                                            "  let fullName=null; const mt=document.querySelector('meta[property=\"og:title\"]'); if(mt){ const t=mt.getAttribute('content')||''; const mm=t.match(/^(.+?)\\s\\(@/); if(mm) fullName=mm[1].trim(); } if(!fullName){ const nameEl=document.querySelector('header h1, header h2'); if(nameEl){ const nt=grabText(nameEl).trim(); if(nt) fullName=nt; } }\n"
+                                            "  let followers=null, following=null; const md=document.querySelector('meta[property=\"og:description\"]'); if(md){ const t=md.getAttribute('content')||''; const mf=t.match(/([0-9.,]+)\\s*(followers|seguidores)/i); const mg=t.match(/([0-9.,]+)\\s*(following|seguidos)/i); if(mf) followers=parseNum(mf[1]); if(mg) following=parseNum(mg[1]); }\n"
+                                            "  if(followers===null){ const aF=document.querySelector('header section ul li a[href$=\"/followers/\"]'); if(aF){ const v=parseNum(grabText(aF)); if(v!==null) followers=v; } }\n"
+                                            "  if(following===null){ const aG=document.querySelector('header section ul li a[href$=\"/following/\"]'); if(aG){ const v=parseNum(grabText(aG)); if(v!==null) following=v; } }\n"
+                                            "  let biography=''; const bioCandidates=Array.from(document.querySelectorAll('[data-testid=\"user-bio\"], header section div, header section p')); for(const el of bioCandidates){ const txt=grabText(el).trim(); if(txt && !/[0-9.,]+\\s*(followers|seguidores|following|seguidos)/i.test(txt) && txt.length>=8){ biography=txt; break; } }\n"
+                                            "  return { full_name: fullName, biography, followers, following };\n"
+                                            "})()"
+                                        )
+                                        if not fb_item.get("full_name") and dom_vals.get("full_name"):
+                                            fb_item["full_name"] = dom_vals.get("full_name")
+                                        if fb_item.get("followers") is None and dom_vals.get("followers") is not None:
+                                            fb_item["followers"] = dom_vals.get("followers")
+                                        if fb_item.get("following") is None and dom_vals.get("following") is not None:
+                                            fb_item["following"] = dom_vals.get("following")
+                                    except Exception:
+                                        pass
+                                try:
+                                    logger.info(
+                                        "[UI-fallback] %s | nombre='%s' | seguidores=%s | seguidos=%s",
+                                        uname,
+                                        fb_item.get("full_name") or "",
+                                        str(fb_item.get("followers")),
+                                        str(fb_item.get("following")),
+                                    )
+                                except Exception:
+                                    pass
+                                out.append(fb_item)
                             except Exception:
                                 out.append({"username": uname, "full_name": None, "biography": "", "account_type": None, "category": None, "followers": None, "following": None, "url": f"https://www.instagram.com/{uname}/"})
                     return {"username": username, "following_count": None, "following_details": out}
@@ -649,15 +889,17 @@ class BrowserInstagramScraper:
   function parseNum(txt){
     if (!txt) return null;
     const t = String(txt).trim();
-    const m = t.match(/([0-9.,]+)\\s*([kKmM])?/);
+    const m = t.match(/([0-9.,]+)\\s*(k|m|K|M|mil|millones|millon|millón)?/i);
     if (!m) return null;
-    let n = m[1].replace(/\s/g,'');
-    n = n.replace(/\.(?=\d{3}\b)/g,'');
-    n = n.replace(/,(?=\d{3}\b)/g,'');
+    let n = m[1].replace(/\\s/g,'');
+    n = n.replace(/\\.(?=\\d{3}\\b)/g,'');
+    n = n.replace(/,(?=\\d{3}\\b)/g,'');
     let val = Number(n.replace(',', '.'));
     const suf = m[2] ? m[2].toLowerCase() : '';
     if (suf==='k') val = Math.round(val*1000);
     if (suf==='m') val = Math.round(val*1000000);
+    if (suf==='mil') val = Math.round(val*1000);
+    if (suf==='millones' || suf==='millon' || suf==='millón') val = Math.round(val*1000000);
     return Number.isFinite(val) ? val : null;
   }
   const selStr = `a[href$='/followers/'] span, a[href$='/followers/'] div, header section ul li a[href$='/followers/']`;
@@ -669,9 +911,9 @@ class BrowserInstagramScraper:
       if (v!==null) return v;
     }
   }
-  const m = document.querySelector('meta[property="og:description"]');
+  const m = document.querySelector('meta[property=\"og:description\"]');
   const t = m ? (m.getAttribute('content')||'') : '';
-  const re = /([0-9.,]+)\s*(followers|seguidores)/i;
+  const re = /([0-9.,]+)\\s*(followers|seguidores)/i;
   const mm = t.match(re);
   if (mm){
     const v = parseNum(mm[1]);

@@ -97,6 +97,15 @@ def main() -> None:
             rows = []
             print(f"Items scrapeados: {len(items)}")
             for it in items:
+                try:
+                    uname = it.get("username") or ""
+                    fn = it.get("full_name") or ""
+                    bio = it.get("biography") or ""
+                    followers = it.get("followers")
+                    following = it.get("following")
+                    print(f"[following] {uname} | nombre='{fn}' | bio_len={len(bio)} | seguidores={followers} | seguidos={following}")
+                except Exception:
+                    pass
                 rows.append([
                     it.get("full_name") or "",
                     it.get("username") or "",
