@@ -35,6 +35,18 @@ def build_parser() -> argparse.ArgumentParser:
     followers_parser.add_argument("--retry-tries", type=int, default=10, help="Intentos de reintento ante 429/0")
     followers_parser.add_argument("--retry-base-ms", type=int, default=2500, help="Base de backoff en ms")
 
+    # Subcomando de seguidos (following) y detalles
+    following_parser = subparsers.add_parser("following", help="Listar seguidos del perfil y detalles por usuario")
+    following_parser.add_argument("--url", required=True, help="Enlace del perfil de Instagram")
+    following_parser.add_argument("--limit", type=int, default=20, help="Cantidad de seguidos a consultar")
+    following_parser.add_argument("--output", type=Path, default=None, help="Archivo de salida (.xlsx/.csv recomendado)")
+    following_parser.add_argument("--page-size", type=int, default=12, help="Tamaño de página para paginación")
+    following_parser.add_argument("--chunk", type=int, default=2, help="Tamaño de lote para consultas de detalle")
+    following_parser.add_argument("--delay-ms", type=int, default=3000, help="Retraso entre páginas/lotes en ms")
+    following_parser.add_argument("--retry-tries", type=int, default=10, help="Intentos de reintento ante 429/0")
+    following_parser.add_argument("--retry-base-ms", type=int, default=2500, help="Base de backoff en ms")
+    following_parser.add_argument("--force-ui", action="store_true", help="Forzar modo UI (diálogo de seguidos y scroll)")
+
     # Subcomando de scraping con Instaloader (opcional)
     legacy_parser = subparsers.add_parser("legacy", help="Scrapear con Instaloader (login IG opcional)")
     legacy_parser.add_argument("--url", required=True, help="Enlace del perfil de Instagram")
@@ -63,6 +75,89 @@ def main() -> None:
     elif args.command == "scrape":
         scraper = BrowserInstagramScraper(config)
         data = scraper.get_profile_data(args.url, posts_limit=args.posts)
+    elif args.command == "following":
+        import time as _t
+        t0 = _t.time()
+        scraper = BrowserInstagramScraper(config)
+        data = scraper.get_following_details(
+            args.url,
+            following_limit=args.limit,
+            page_size=args.page_size,
+            chunk=args.chunk,
+            delay_ms=args.delay_ms,
+            retry_tries=args.retry_tries,
+            retry_base_ms=args.retry_base_ms,
+            force_ui=getattr(args, "force_ui", False),
+        )
+        if data is None:
+            data = {"username": None, "following_details": []}
+        out_path = getattr(args, "output", None)
+        items = data.get("following_details", [])
+        if out_path and out_path.suffix.lower() in {".xlsx", ".csv"}:
+            rows = []
+            print(f"Items scrapeados: {len(items)}")
+            for it in items:
+                rows.append([
+                    it.get("full_name") or "",
+                    it.get("username") or "",
+                    it.get("biography") or "",
+                    it.get("account_type") or "",
+                    it.get("category") or "",
+                    it.get("followers") if it.get("followers") is not None else "",
+                    it.get("following") if it.get("following") is not None else "",
+                    it.get("url") or "",
+                ])
+
+            if out_path.suffix.lower() == ".xlsx":
+                try:
+                    from openpyxl import Workbook
+                    wb = Workbook()
+                    ws = wb.active
+                    ws.title = "following"
+                    ws.append(["nombre", "usuario", "biografia", "tipo_de_cuenta", "categoria", "seguidores", "seguidos", "enlace"])
+                    for r in rows:
+                        ws.append(r)
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    wb.save(str(out_path))
+                    print(f"Archivo Excel guardado en {out_path}")
+                    print(f"Tiempo total: {round(_t.time()-t0, 2)}s")
+                    return
+                except Exception as e:
+                    # Intento adicional: si el archivo está abierto (Windows bloquea con Excel), probar con un nombre alternativo
+                    msg = str(e)
+                    try:
+                        if "Permission denied" in msg or getattr(e, "errno", None) == 13:
+                            alt_path = out_path.with_name(out_path.stem + "_v2" + out_path.suffix)
+                            from openpyxl import Workbook
+                            wb2 = Workbook()
+                            ws2 = wb2.active
+                            ws2.title = "following"
+                            ws2.append(["nombre", "usuario", "biografia", "tipo_de_cuenta", "categoria", "seguidores", "seguidos", "enlace"])
+                            for r in rows:
+                                ws2.append(r)
+                            alt_path.parent.mkdir(parents=True, exist_ok=True)
+                            wb2.save(str(alt_path))
+                            print(f"Archivo Excel bloqueado, se guardó en {alt_path}")
+                            print(f"Tiempo total: {round(_t.time()-t0, 2)}s")
+                            return
+                    except Exception as e2:
+                        print(f"No se pudo escribir Excel alternativo: {e2}.")
+                    print(f"No se pudo escribir Excel (.xlsx): {e}. Se imprimirá JSON.")
+
+            if out_path.suffix.lower() == ".csv":
+                try:
+                    import csv
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    with out_path.open("w", newline="", encoding="utf-8") as f:
+                        writer = csv.writer(f)
+                        writer.writerow(["nombre", "usuario", "biografia", "tipo_de_cuenta", "categoria", "seguidores", "seguidos", "enlace"])
+                        for r in rows:
+                            writer.writerow(r)
+                    print(f"Archivo CSV guardado en {out_path}")
+                    print(f"Tiempo total: {round(_t.time()-t0, 2)}s")
+                    return
+                except Exception as e:
+                    print(f"No se pudo escribir CSV (.csv): {e}. Se imprimirá JSON.")
     elif args.command == "followers":
         import time as _t
         t0 = _t.time()

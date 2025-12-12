@@ -92,10 +92,10 @@ Parámetros:
 Scrapea los seguidores de un perfil y, para cada uno, obtiene su cantidad de seguidores. Requiere sesión válida (ejecuta primero `auth`).
 
 ```bash
-python main.py followers \
-  --url https://www.instagram.com/<username>/ \
-  --limit 50 \
-  --output storage/<username>_followers_counts.xlsx
+python main.py followers
+  --url "https://www.instagram.com/<username>/"
+  --limit 50
+  --output "storage/<username>_followers_counts.xlsx"
 ```
 
 - `--limit`: número máximo de seguidores del perfil a procesar.
@@ -109,6 +109,21 @@ Detalles de salida y logs:
 - `count`: número total de seguidores del perfil (no los procesados), obtenido desde `web_profile_info` cuando está disponible.
 - Logs imprimen líneas del tipo `Items recogidos (API|UI): N` y `username: followers` por cada item, además de `Count (followers del perfil): <num>`.
 - Cuando la API limita, el scraper cae a modo UI: abre el diálogo de seguidores, scrollea y extrae usernames; el conteo por usuario se obtiene via `web_profile_info` y, si falla, con lectura del `og:description` del perfil.
+
+### Following (seguidos) con detalles (Excel/CSV)
+
+Scrapea los usuarios que un perfil sigue y, para cada uno, obtiene detalles básicos. Requiere sesión válida (ejecuta primero `auth`).
+
+```bash
+python main.py following \
+  --url "https://www.instagram.com/<username>/" \
+  --limit 50 \
+  --output "storage/<username>_following_details.xlsx"
+```
+
+- Exporta columnas: `nombre`, `usuario`, `biografia`, `tipo_de_cuenta` (`personal|creador|empresa`), `categoria` (si existe), `seguidores`, `seguidos`, `enlace`.
+- Parámetros de robustez iguales que `followers`: `--page-size`, `--chunk`, `--delay-ms`, `--retry-tries`, `--retry-base-ms`.
+- Usa un enfoque API‑first y, si hay límite, cae a un modo UI que abre el diálogo de “Seguidos” y scrollea para recolectar `username`, completando detalles con `web_profile_info`.
 
 ### Variables de entorno (completo)
 Crea un `.env` en la raíz del proyecto:
@@ -200,3 +215,103 @@ instagram-scraper/
 
 ## Licencia
 Sin licencia específica; adapta a tus necesidades.
+
+## Descripción técnica por módulos y clases
+
+### Visión general
+- Proyecto en Python para extraer datos de perfiles de Instagram.
+- Ofrece dos vías de scraping complementarias:
+  - API web autenticada mediante navegador (Playwright) y OAuth de Facebook.
+  - Biblioteca Instaloader como alternativa (login IG opcional).
+- Incluye un CLI con subcomandos para autenticación, scraping de perfil y obtención de conteos de seguidores en Excel/CSV.
+
+### Módulos y clases
+
+**`src/instagram_scraper/config.py`**
+- Clase `Config` (dataclass) concentra toda la configuración y credenciales:
+  - Instagram: `ig_username`, `ig_password`, `ig_2fa_code`.
+  - Límite de posts: `posts_limit`.
+  - Facebook OAuth: `fb_email`, `fb_password`, `fb_2fa_code`.
+  - Navegador y sesión: `headless`, `storage_path`, `storage_plain_path`, `auth_secret_key`.
+  - Logs: `log_level`.
+- Función `load_config()` carga variables desde `.env` con `python-dotenv` y devuelve una instancia `Config` lista para usar.
+
+**`src/instagram_scraper/utils.py`**
+- Función `extract_username(profile_url: str) -> str` valida y extrae el `username` desde una URL de perfil.
+  - Rechaza rutas que no sean perfiles (`/p`, `/reels`, `/stories`, etc.).
+  - Aplica regex para garantizar caracteres válidos.
+
+**`src/instagram_scraper/auth.py`**
+- Clase `FacebookAuthenticator` gestiona el login con Facebook y la persistencia segura de la sesión:
+  - Cifrado opcional con `cryptography.fernet` mediante `AUTH_SECRET_KEY`.
+  - Métodos internos para cifrar/descifrar el `storage_state` (
+    `_encrypt_file`, `_decrypt_to_text`).
+  - `login_with_facebook()`: 
+    - Abre la página de login de Instagram.
+    - Maneja pantallas “Continuar” / “Usar otro perfil” y banners de cookies.
+    - Hace clic en “Iniciar sesión con Facebook”, completa credenciales y gestiona 2FA.
+    - Detecta y avisa si hay reCAPTCHA (usar `HEADLESS=false` para resolver manualmente).
+    - Verifica la cookie `sessionid` para confirmar autenticación.
+    - Guarda `storage_state.json` en la ruta “plain” y su versión cifrada en `storage_path`.
+  - `create_context_from_storage(playwright)`: carga el `storage_state` (cifrado o plano) y crea un `browser context` autenticado para reutilizar cookies y almacenamiento.
+
+**`src/instagram_scraper/browser_scraper.py`**
+- Clase `BrowserInstagramScraper` usa Playwright con la sesión OAuth para consultar la API web.
+  - `get_profile_data(url, posts_limit=None)`: 
+    - Crea un contexto autenticado (si existe) o uno nuevo.
+    - Ejecuta `fetch()` dentro del contexto hacia `web_profile_info` para obtener `username`, `full_name`, `biography`, `followers`, `following`, `posts_count` y las publicaciones recientes.
+  - `get_followers_counts_for_followers(url, ...)`:
+    - Obtiene la lista de seguidores del perfil por páginas (`page_size`) y luego, en bloques (`chunk`), consulta el contador de seguidores de cada uno.
+    - Implementa reintentos con backoff ante `429/0`.
+    - Si la API limita o falla, cae a un “modo UI”: abre el diálogo de seguidores, scrollea para recolectar `usernames` y luego intenta obtener los conteos por API o leyendo el `og:description` del perfil.
+    - Devuelve un diccionario con `count` (seguidores del perfil), `scraped_count` y `followers_of_followers` (lista con `{ username, followers }`).
+
+**`src/instagram_scraper/scraper.py`**
+- Clase `InstagramScraper` (alternativa basada en Instaloader):
+  - `login_if_available()`: autentica con credenciales IG si están disponibles, manejando 2FA.
+  - `get_profile_data(url, posts_limit=None)`: usa Instaloader para obtener los datos del perfil y limita la lista de publicaciones.
+  - Útil para escenarios donde OAuth no es necesario o como fallback.
+
+**`src/instagram_scraper/cli.py`**
+- Define el CLI y los subcomandos:
+  - `auth [--headless true|false]`: ejecuta el flujo OAuth de Facebook y guarda la sesión cifrada/plane.
+  - `scrape --url <perfil> [--posts N] [--output JSON]`: obtiene datos del perfil vía API web.
+  - `followers --url <perfil> [--limit N] [--output .xlsx|.csv]` y parámetros de robustez (`page-size`, `chunk`, `delay-ms`, `retry-tries`, `retry-base-ms`).
+  - `legacy --url <perfil> [--posts N] [--output JSON] [--login]`: usa Instaloader y credenciales IG.
+- Si `--output` termina en `.xlsx` o `.csv` (subcomando `followers`), exporta columnas `username`, `seguidores`, `primer_digito`.
+
+**`src/instagram_scraper/__init__.py`**
+- Expone `config`, `utils`, `scraper` en `__all__` y define `__version__`.
+
+**`main.py`**
+- Atajo para ejecutar el CLI sin instalar el paquete: añade `src/` al `PYTHONPATH` y llama `instagram_scraper.cli.main()`.
+
+**`pyproject.toml`**
+- Metadatos del proyecto, dependencias (`instaloader`, `python-dotenv`, `playwright`, `cryptography`, `openpyxl`) y entry-point `instagram-scraper = instagram_scraper.cli:main`.
+
+### Flujos principales
+- Autenticación (`auth`): guarda la sesión para posteriores llamadas a la API web.
+- Scraping de perfil (`scrape`): usa la sesión para consultar `web_profile_info` y devolver JSON.
+- Followers de followers (`followers`): recolecta usuarios y sus conteos; exporta a Excel/CSV si se indica.
+- Alternativa `legacy`: extrae con Instaloader.
+
+### Entradas y salidas
+- Entrada: URL del perfil (p.ej. `https://www.instagram.com/<username>/`).
+- Salida JSON: datos del perfil y publicaciones.
+- Salida Excel/CSV (followers): filas con `username`, `seguidores`, `primer_digito`.
+
+### Variables de entorno clave
+- `FB_EMAIL`, `FB_PASSWORD`, `FB_2FA_CODE` (opcional) para OAuth.
+- `HEADLESS` (`true`/`false`) para mostrar/ocultar el navegador.
+- `AUTH_SECRET_KEY` para cifrar sesión; `AUTH_STORAGE_PATH` y `AUTH_STORAGE_PLAIN_PATH` para rutas de sesión.
+- `IG_USERNAME`, `IG_PASSWORD`, `IG_2FA_CODE` para Instaloader (legacy).
+
+### Robustez y límites
+- Manejo de rate limit: `retry-tries`, `retry-base-ms`, pausas `delay-ms`, tamaño de `chunk`.
+- Fallback por UI cuando la API no responde.
+- Recomendaciones ante `429`: esperar, reducir ritmo, usar `chunk=1`, `delay-ms>=5000`, cambiar IP si es necesario.
+
+### Comandos de ejemplo
+- Autenticación: `python main.py auth --headless false`
+- Perfil: `python main.py scrape --url "https://www.instagram.com/<username>/" --posts 5 --output profile.json`
+- Followers (Excel): `python main.py followers --url "https://www.instagram.com/<username>/" --limit 50 --output "storage/<username>_followers_counts.xlsx"`
